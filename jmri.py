@@ -1,10 +1,10 @@
-
 import json
 import urllib.request
 import urllib.parse
 import logging
 
 from enums import *
+from layout_handle import LayoutHandle
 
 SIGNAL_ENUM_TO_JMRI_ASPECT = {
 	SIGNAL_CLEAR: 'Clear',
@@ -15,13 +15,11 @@ SIGNAL_ENUM_TO_JMRI_ASPECT = {
 	SIGNAL_APPROACH_DIVERGING: 'Approach Diverging',
 	SIGNAL_APPROACH_RESTRICTING: 'Approach Restricting',
 	SIGNAL_RESTRICTING: 'Restricting',
-
 	SIGNAL_DIVERGING_CLEAR: 'Diverging Clear',
 	SIGNAL_DIVERGING_CLEAR_LIMITED: 'Diverging Clear Limited',
 	SIGNAL_DIVERGING_ADVANCE_APPROACH: 'Diverging Advance Approach',
 	SIGNAL_DIVERGING_APPROACH: 'Diverging Approach',
 	SIGNAL_DIVERGING_RESTRICTING: 'Restricting (Diverging)',
-
 	SIGNAL_STOP: 'Stop',
 }
 
@@ -36,34 +34,34 @@ HEAD_ENUM_TO_JMRI_NUMBER = {
 	HEAD_DARK: 0,
 }
 
-class JMRI(object):
-	def __init__(self, jmri_server_address):
+
+class JMRI(LayoutHandle):
+
+	def __init__(self, jmri_server_address: str):
 		self._jmri_server_address = jmri_server_address
 
-	def _GetJsonData(self, url_path):
+	def _GetJsonData(self, url_path: str):
 		# JMRI JSON docs:
 		# http://jmri.sourceforge.net/help/en/html/web/JsonServlet.shtml
 		url = urllib.parse.urljoin(self._jmri_server_address, url_path)
 		logging.debug('Fetching JMRI JSON data from %s', url)
-		return json.load(urllib.request.urlopen(url))
+		with urllib.request.urlopen(url) as f:
+			return json.load(f)
 
-	def _PostToJMRI(self, url, json_data, create_on_404=False):
+	def _PostToJMRI(self, url: str, json_data: str) -> None:
 		req = urllib.request.Request(url, json_data.encode(), {'Content-Type': 'application/json'})
 		try:
-			f = urllib.request.urlopen(req)
+			with urllib.request.urlopen(req) as f:
+				response = f.read()
 		except Exception as err:
 			logging.error('JMRI POST failed: %s [%s]', err, url)
 			return
-		response = f.read()
-		f.close()
 		logging.debug('JMRI POST response: %s', response)
 
-	def GetCurrentTurnoutData(self):
-		"""Returns a dictionary of {turnout name} -> {turnout value}."""
-		turnout_data_json = self._GetJsonData('/json/turnouts')
+	def GetCurrentTurnoutData(self) -> dict:
+		"""Returns {turnout name -> turnout value}."""
 		turnout_states = {}
-
-		for turnout in turnout_data_json:
+		for turnout in self._GetJsonData('/json/turnouts'):
 			name = turnout['data']['name']
 			state = turnout['data']['state']
 			if state == 2:
@@ -71,96 +69,74 @@ class JMRI(object):
 			elif state == 4:
 				turnout_state = TURNOUT_THROWN
 			else:
-				#logging.debug(
-				#	'Turnout %s had unknown json state value %s', name, state)
 				turnout_state = TURNOUT_UNKNOWN
 			turnout_states[name] = turnout_state
 		logging.debug('Fetched data for %d turnouts', len(turnout_states))
 		return turnout_states
 
-	def GetCurrentSensorData(self):
-		"""Returns a dictionary of {sensor name} -> {sensor value}."""
-		sensor_data_json = self._GetJsonData('/json/sensors')
+	def GetCurrentSensorData(self) -> dict:
+		"""Returns {sensor name -> sensor value}."""
 		sensor_states = {}
-
-		logging.debug(sensor_data_json)
-
-		for sensor in sensor_data_json:
+		for sensor in self._GetJsonData('/json/sensors'):
 			name = sensor['data']['name']
-			userName = sensor['data'].get('userName')
+			user_name = sensor['data'].get('userName')
 			state = sensor['data']['state']
 			if state == 2:
 				sensor_state = SENSOR_ACTIVE
 			elif state == 4:
 				sensor_state = SENSOR_INACTIVE
 			else:
-				logging.debug(
-					'Sensor %s (%s) had unknown json state value %s', name, userName, state)
+				logging.debug('Sensor %s (%s) had unknown json state value %s', name, user_name, state)
 				sensor_state = SENSOR_UNKNOWN
 			sensor_states[name] = sensor_state
-			if userName:
-				sensor_states[userName] = sensor_state
+			if user_name:
+				sensor_states[user_name] = sensor_state
 		logging.debug('Fetched data for %d sensors', len(sensor_states))
 		return sensor_states
 
-	def GetMemoryVariables(self):
+	def GetMemoryVariables(self) -> dict:
 		"""Returns {memory_name -> memory_value}."""
-		memory_data_json = self._GetJsonData('/json/memory')
 		memory_states = {}
-		for var in memory_data_json:
+		for var in self._GetJsonData('/json/memory'):
 			name = var['data']['name']
 			val = var['data']['value']
 			memory_states[name] = val
 		logging.debug('Fetched %d memory values', len(memory_states))
 		return memory_states
 
-	def SetTriLightSignalHeadAppearance(self, head_name, unused_address, appearance):
+	def SetTriLightSignalHeadAppearance(self, head_name: str, unused_address, appearance: str, ignore_cache: bool = False) -> None:
 		jmri_number = HEAD_ENUM_TO_JMRI_NUMBER.get(appearance, -1)
 		if jmri_number == -1:
-			raise RuntimeError('Appearance %s invalid' % appearance)
-		path = '/json/signalHead/' + head_name
+			raise RuntimeError(f'Appearance {appearance} invalid')
+		path = f'/json/signalHead/{head_name}'
 		url = urllib.parse.urljoin(self._jmri_server_address, path)
-
 		json_data = json.dumps({
-			"type": "signalHead",
-			"data": {
-				"name": head_name,
-				"state": jmri_number,
-			}
+			'type': 'signalHead',
+			'data': {'name': head_name, 'state': jmri_number},
 		})
 		logging.debug('Posting signal head change to %s: %s', url, json_data)
 		self._PostToJMRI(url, json_data)
 
-	def SetSignalMastAspect(self, mast_name, unused_address, aspect):
-		"""Sets mast_name to an aspect.
-		   mast_name matches a signal mast name in JMRI.
-		   aspect is a SIGNAL_* enum value.
-		"""
+	def SetSignalMastAspect(self, mast_name: str, unused_address, aspect: str) -> None:
+		"""Sets mast_name to an aspect. aspect is a SIGNAL_* enum value."""
 		json_state = SIGNAL_ENUM_TO_JMRI_ASPECT.get(aspect)
 		if not json_state:
 			raise RuntimeError('Aspect invalid')
-		path = '/json/signalMast/' + mast_name
+		path = f'/json/signalMast/{mast_name}'
 		url = urllib.parse.urljoin(self._jmri_server_address, path)
-
 		json_data = json.dumps({
-			"type": "signalMast",
-			"data": {
-				"name": mast_name,
-				"state": json_state,
-			}
+			'type': 'signalMast',
+			'data': {'name': mast_name, 'state': json_state},
 		})
 		logging.debug('Posting signal aspect change to %s: %s', url, json_data)
 		self._PostToJMRI(url, json_data)
 
-	def SetMemoryVar(self, var_name, value):
-		path = '/json/memory/' + var_name 
+	def SetMemoryVar(self, var_name: str, value: str) -> None:
+		path = f'/json/memory/{var_name}'
 		url = urllib.parse.urljoin(self._jmri_server_address, path)
 		json_data = json.dumps({
-			"type": "memory",
-			"data": {
-				"value": value,
-			}	
+			'type': 'memory',
+			'data': {'value': value},
 		})
-		logging.info("Posting memory var to %s: %s", url, json_data)
-		self._PostToJMRI(url, json_data, create_on_404=False)
-
+		logging.info('Posting memory var to %s: %s', url, json_data)
+		self._PostToJMRI(url, json_data)
