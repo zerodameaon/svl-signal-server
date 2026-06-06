@@ -495,9 +495,11 @@ def Update(jmri_handle, openlcb_handle, reset_terminal=False):
             print(chr(27) + "[2J")
         print('Signal Server Status' + signaling_mode_suffix)
         print(table)
+        return True
 
     except Exception as e:
         logging.exception(e)
+        return False
 
 
 def main():
@@ -524,16 +526,42 @@ def main():
 
     jmri_handle = jmri.JMRI(SVL_JMRI_SERVER_HOST)
 
+    print('Waiting for JMRI at %s...' % SVL_JMRI_SERVER_HOST)
+    while True:
+        try:
+            jmri_handle.GetCurrentTurnoutData()
+            print('JMRI connected.')
+            break
+        except Exception:
+            logging.info('JMRI not ready, retrying in 5s')
+            print('JMRI not ready, retrying in 5s...')
+            time.sleep(5)
+
     openlcb_handle = OpenlcbLayoutHandle(None)
 
     if args.status_port:
         _StartStatusServer(args.status_port)
 
+    _MAX_BACKOFF_SECS = 30
+    consecutive_failures = 0
+
     while True:
-        Update(jmri_handle, openlcb_handle, reset_terminal=args.pretty)
+        success = Update(jmri_handle, openlcb_handle, reset_terminal=args.pretty)
+        if success:
+            if consecutive_failures > 0:
+                logging.info('JMRI reconnected after %d failure(s)', consecutive_failures)
+                print('JMRI reconnected.')
+                consecutive_failures = 0
+            sleep_secs = SECONDS_BETWEEN_POLLS
+        else:
+            consecutive_failures += 1
+            sleep_secs = min(SECONDS_BETWEEN_POLLS * (2 ** consecutive_failures), _MAX_BACKOFF_SECS)
+            logging.info('JMRI unreachable, retrying in %.1fs (failure %d)', sleep_secs, consecutive_failures)
+            print('JMRI unreachable, retrying in %.1fs...' % sleep_secs)
+
         if args.pretty:
             print('Last Update:', time.ctime(time.time()))
-        time.sleep(SECONDS_BETWEEN_POLLS)
+        time.sleep(sleep_secs)
 
 
 if __name__ == '__main__':
