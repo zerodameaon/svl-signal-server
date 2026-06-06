@@ -5,13 +5,11 @@ from signal_requirements import *
 import signal_config
 import jmri
 import os
-import traceback
 import time
 import prettytable
 from lxml import etree
 import socket
 from threading import Thread, RLock
-import sys
 import json
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,9 +18,18 @@ SIGNAL_CONFIG_FILE = os.path.join(DIR, 'signal_config.yaml')
 SVL_JMRI_SERVER_HOST = 'http://127.0.0.1:3000'
 SECONDS_BETWEEN_POLLS = 1.5
 
-# This could be smarter if we listened to requests
-# from freshly-booted nodes.
-SECONDS_BETWEEN_FULL_LCC_CACHE_BROADCAST = None
+
+_config_cache = None
+_config_mtime = None
+
+def _LoadConfigCached():
+    global _config_cache, _config_mtime
+    mtime = os.path.getmtime(SIGNAL_CONFIG_FILE)
+    if _config_cache is None or mtime != _config_mtime:
+        _config_cache = signal_config.LoadConfig(SIGNAL_CONFIG_FILE)
+        _config_mtime = mtime
+        logging.info('Reloaded config from %s', SIGNAL_CONFIG_FILE)
+    return _config_cache
 
 
 # Shared state for the optional HTTP status endpoint. Populated by Update(),
@@ -116,10 +123,10 @@ class OpenlcbLayoutHandle(object):
         # {mast_name -> (first_eventid, appearance)}
         self._cache = {}
         self._last_broadcast_time = time.time()
+        self._rcv_data = ''
         self._recv_thread = Thread(target=self._CheckForIncomingLCCData)
         self._recv_thread.daemon = True
         self._recv_thread.start()
-        self._rcv_data = ''
 
     def _InitSocket(self):
         logging.info('Initializing OpenLCB Hub socket')
@@ -150,20 +157,20 @@ class OpenlcbLayoutHandle(object):
                 except:
                     logging.exception('LCC data check failed')
 
-                while True:
-                    self._rcv_data = self._rcv_data.lstrip()
-                    logging.debug('In recv queue: "%s"', self._rcv_data)
-                    semicolon_idx = self._rcv_data.find(';')
-                    if semicolon_idx == -1:
-                        logging.debug('Recv buffer does not contain an end of frame')
-                        break
-                    if not self._rcv_data.startswith(':X'):
-                        # chop off invalid prefix data
-                        self._rcv_data = self._rcv_data[semicolon_idx + 1:]
-                        continue
-                    packet = self._rcv_data[:semicolon_idx]
-                    self._ProcessCANPacket(packet)
+            while True:
+                self._rcv_data = self._rcv_data.lstrip()
+                logging.debug('In recv queue: "%s"', self._rcv_data)
+                semicolon_idx = self._rcv_data.find(';')
+                if semicolon_idx == -1:
+                    logging.debug('Recv buffer does not contain an end of frame')
+                    break
+                if not self._rcv_data.startswith(':X'):
+                    # chop off invalid prefix data
                     self._rcv_data = self._rcv_data[semicolon_idx + 1:]
+                    continue
+                packet = self._rcv_data[:semicolon_idx]
+                self._ProcessCANPacket(packet)
+                self._rcv_data = self._rcv_data[semicolon_idx + 1:]
 
             time.sleep(1)
 
@@ -429,7 +436,7 @@ def _StartStatusServer(port):
 
 def Update(jmri_handle, openlcb_handle, reset_terminal=False):
     try:
-        signal_masts_by_name = signal_config.LoadConfig(SIGNAL_CONFIG_FILE)
+        signal_masts_by_name = _LoadConfigCached()
 
         context = LayoutContext(jmri_handle.GetCurrentTurnoutData(),
                                 jmri_handle.GetCurrentSensorData(),
@@ -491,9 +498,6 @@ def Update(jmri_handle, openlcb_handle, reset_terminal=False):
 
     except Exception as e:
         logging.exception(e)
-        print('ERROR!   ' + str(e) + '\n')
-        traceback.print_exc()
-        print('')
 
 
 def main():
@@ -510,7 +514,6 @@ def main():
         'format': '%(asctime)s %(filename)s:%(lineno)d %(message)s',
         'level': logging.DEBUG,
     }
-    # if args.pretty or args.output_xml:
     logging_args['filename'] = 'svl_signal_server.log'
 
     logging.basicConfig(**logging_args)
@@ -520,10 +523,6 @@ def main():
         return
 
     jmri_handle = jmri.JMRI(SVL_JMRI_SERVER_HOST)
-
-    # openlcb_network = openlcb_python.tcpolcblink.TcpToOlcbLink()
-    # openlcb_network.host = 'localhost'
-    # openlcb_network.port = 12021
 
     openlcb_handle = OpenlcbLayoutHandle(None)
 
