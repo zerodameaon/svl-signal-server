@@ -11,10 +11,7 @@ import prettytable
 from lxml import etree
 import socket
 from threading import Thread, RLock
-from selenium import webdriver
-from selenium.webdriver.common.by import By
 import sys
-import urllib.parse
 import json
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,7 +24,6 @@ SECONDS_BETWEEN_POLLS = 1.5
 # from freshly-booted nodes.
 SECONDS_BETWEEN_FULL_LCC_CACHE_BROADCAST = None
 
-SCRAPE_PANELS_ON_STARTUP = False
 
 # Shared state for the optional HTTP status endpoint. Populated by Update(),
 # read by the status server. Lock is mandatory: Update() runs in main thread,
@@ -100,12 +96,12 @@ def OutputXML():
     signal_masts_by_name = signal_config.LoadConfig(SIGNAL_CONFIG_FILE)
     signalheads = etree.Element('signalheads')
     for name, mast in signal_masts_by_name.items():
-        if type(mast) == signal_config.DoubleHeadTriLightMast:
+        if isinstance(mast, signal_config.DoubleHeadTriLightMast):
             upper = _SignalHeadTree(mast._upper_head_address, mast._mast_name + '_upper')
             signalheads.append(upper)
             lower = _SignalHeadTree(mast._lower_head_address, mast._mast_name + '_lower')
             signalheads.append(lower)
-        elif type(mast) == signal_config.SingleHeadTriLightMast:
+        elif isinstance(mast, signal_config.SingleHeadTriLightMast):
             signalheads.append(_SignalHeadTree(mast._head_address, mast._mast_name))
 
     print(etree.tostring(signalheads, pretty_print=True))
@@ -317,11 +313,9 @@ class OpenlcbLayoutHandle(object):
         with self._s_lock:
             logging.info('  Sending LCC CAN packet %s', frame)
             try:
-                err = self._s.sendall(frame.encode())
-            except Exception as e:
-                err = e
-            if err is not None:
-                logging.exception('Send to socket failed', err)
+                self._s.sendall(frame.encode())
+            except Exception:
+                logging.exception('Send to socket failed')
                 self._InitSocket()
 
     def _BroadcastCache(self):
@@ -502,56 +496,10 @@ def Update(jmri_handle, openlcb_handle, reset_terminal=False):
         print('')
 
 
-def ScrapePanels(interval_sec):
-    driver = webdriver.Safari(quiet=True, keep_alive=False)
-    USER_PANELS = 'http://127.0.0.1:3000/web/svg/userPanels/index.svg'
-    try:
-        driver.implicitly_wait(3)
-        driver.get(USER_PANELS)
-        urls = set()
-        for link in driver.find_elements(By.TAG_NAME, 'a'):
-            target = link.get_attribute('xlink:href')
-            if '.svg' not in target:
-                continue
-            url = urllib.parse.urljoin(USER_PANELS, target)
-            if url not in urls:
-                urls.add(url)
-                print('Adding URL', url)
-
-        USE_THREADS = False
-
-        if USE_THREADS:
-            threads = []
-            for url in urls:
-                t = Thread(target=Scrape, args=(url,))
-                t.daemon = True
-                t.start()
-                threads.append(t)
-
-            for t in threads:
-                t.join(10)
-        else:
-            for url in sorted(urls):
-                driver.get(url)
-                time.sleep(0.5)
-
-    except:
-        logging.exception('Webdriver failed')
-        #raise
-    finally:
-        driver.quit()
-
-def Scrape(url):
-    driver = webdriver.Safari(quiet=True, keep_alive=False)
-    driver.get(url)
-    time.sleep(2)
-
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pretty', type=bool, default=False)
-    parser.add_argument('--output_xml', type=bool, default=False)
-    parser.add_argument('--scrape_panel_interval_sec', type=int, default=20)
+    parser.add_argument('--pretty', action='store_true')
+    parser.add_argument('--output_xml', action='store_true')
     parser.add_argument(
         '--status_port', type=int, default=0,
         help='If non-zero, start an HTTP server on this port exposing /status '
@@ -576,9 +524,6 @@ def main():
     # openlcb_network = openlcb_python.tcpolcblink.TcpToOlcbLink()
     # openlcb_network.host = 'localhost'
     # openlcb_network.port = 12021
-
-    if SCRAPE_PANELS_ON_STARTUP:
-        ScrapePanels(interval_sec=args.scrape_panel_interval_sec)
 
     openlcb_handle = OpenlcbLayoutHandle(None)
 
