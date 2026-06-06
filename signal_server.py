@@ -14,11 +14,12 @@ from threading import Thread, RLock
 from selenium import webdriver
 import sys
 import urllib.parse
+import json
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 
 SIGNAL_CONFIG_FILE = os.path.join(DIR, 'signal_config.yaml')
-SVL_JMRI_SERVER_HOST = 'http://127.0.0.1:12080'
+SVL_JMRI_SERVER_HOST = 'http://127.0.0.1:3000'
 SECONDS_BETWEEN_POLLS = 1.5
 
 # This could be smarter if we listened to requests
@@ -26,6 +27,17 @@ SECONDS_BETWEEN_POLLS = 1.5
 SECONDS_BETWEEN_FULL_LCC_CACHE_BROADCAST = None
 
 SCRAPE_PANELS_ON_STARTUP = False
+
+# Shared state for the optional HTTP status endpoint. Populated by Update(),
+# read by the status server. Lock is mandatory: Update() runs in main thread,
+# HTTP requests come in on the http.server thread.
+_status_lock = RLock()
+_status_state = {
+    'masts': {},        # {mast_name: {type, aspect, appearance, upper, lower, lit, reason, ts}}
+    'last_update_ts': None,
+    'signaling_mode': None,  # 'block' or 'dispatch'
+    'config_path': SIGNAL_CONFIG_FILE,
+}
 
 # TODO: JMRI handle should be passed in to SignalMast __init__.
 
@@ -317,6 +329,109 @@ class OpenlcbLayoutHandle(object):
             self.SetTriLightSignalHeadAppearance(mast_name, first_eventid, appearance, ignore_cache=True)
 
 
+def _DetermineMastTypeAndHeads(mast, summary):
+    """Translate a Mast + SignalSummary into a uniform per-head appearance dict.
+
+    Returns a dict with:
+        type: 'single_tri' | 'double_tri' | 'cpl'
+        upper: HEAD_* string (single head color for single_tri/cpl, upper head for double_tri)
+        lower: HEAD_* string or None (only for double_tri)
+        lit: list of color names that should be displayed as illuminated
+             (used by the editor's diagram to highlight the right LED)
+    """
+    appearance = summary.appearance or ''
+    # appearance is either "X" or "X over Y" (from PrettyAppearance), where X/Y
+    # are HEAD_* values with the 'HEAD_' prefix stripped.
+    parts = [p.strip() for p in appearance.split(' over ')]
+
+    if isinstance(mast, signal_config.DoubleHeadTriLightMast):
+        upper = 'HEAD_' + parts[0] if parts and parts[0] else 'HEAD_DARK'
+        lower = 'HEAD_' + parts[1] if len(parts) > 1 else 'HEAD_DARK'
+        return {
+            'type': 'double_tri',
+            'upper': upper,
+            'lower': lower,
+            'lit': _HeadAppearanceToLitColors(upper) + _HeadAppearanceToLitColors(lower, suffix='_lower'),
+        }
+    if isinstance(mast, signal_config.SingleHeadCPLMast):
+        upper = 'HEAD_' + parts[0] if parts and parts[0] else 'HEAD_DARK'
+        return {
+            'type': 'cpl',
+            'upper': upper,
+            'lower': None,
+            'lit': _HeadAppearanceToLitColors(upper),
+        }
+    # default: SingleHeadTriLightMast
+    upper = 'HEAD_' + parts[0] if parts and parts[0] else 'HEAD_DARK'
+    return {
+        'type': 'single_tri',
+        'upper': upper,
+        'lower': None,
+        'lit': _HeadAppearanceToLitColors(upper),
+    }
+
+
+def _HeadAppearanceToLitColors(head_appearance, suffix=''):
+    """Translate a HEAD_* value into a list of (color, flashing) markers.
+
+    Returns a list of dicts like {'color': 'red', 'flashing': True, 'head': 'upper'|'lower'}.
+    Used by the editor to know which LED dot to draw lit.
+    `suffix` distinguishes upper vs lower for double-head masts.
+    """
+    head = 'lower' if suffix == '_lower' else 'upper'
+    mapping = {
+        'HEAD_GREEN':          ('green', False),
+        'HEAD_FLASHING_GREEN': ('green', True),
+        'HEAD_YELLOW':         ('yellow', False),
+        'HEAD_FLASHING_YELLOW':('yellow', True),
+        'HEAD_RED':            ('red', False),
+        'HEAD_FLASHING_RED':   ('red', True),
+        'HEAD_LUNAR':          ('lunar', False),
+        'HEAD_DARK':           (None, False),
+    }
+    color, flashing = mapping.get(head_appearance, (None, False))
+    if color is None:
+        return []
+    return [{'color': color, 'flashing': flashing, 'head': head}]
+
+
+def _StartStatusServer(port):
+    """Start a tiny HTTP server in a daemon thread that exposes /status."""
+    import http.server
+    from http.server import BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != '/status' and self.path != '/status/':
+                self.send_response(404)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(b'{"error":"not found"}')
+                return
+
+            with _status_lock:
+                payload = json.dumps(_status_state).encode('utf-8')
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            # CORS so the editor (running on a different port) can poll us.
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, fmt, *args):
+            # Don't spam stdout with every poll; route to logging instead.
+            logging.debug('Status HTTP: ' + fmt, *args)
+
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', port), Handler)
+    t = Thread(target=server.serve_forever, name='svl-status-http', daemon=True)
+    t.start()
+    logging.info('Signal status HTTP server listening on port %d', port)
+    print('Signal status HTTP server listening on port %d' % port)
+
+
 def Update(jmri_handle, openlcb_handle, reset_terminal=False):
     try:
         signal_masts_by_name = signal_config.LoadConfig(SIGNAL_CONFIG_FILE)
@@ -329,6 +444,11 @@ def Update(jmri_handle, openlcb_handle, reset_terminal=False):
         table = prettytable.PrettyTable()
         table.field_names = ['Mast', 'Aspect', 'Appearance', 'Reason']
 
+        # We rebuild the snapshot in a local dict, then atomically swap it
+        # into _status_state so HTTP readers never see a half-updated state.
+        new_masts = {}
+        now = time.time()
+
         for mast_name in sorted(signal_masts_by_name.keys(), key=lambda s: s.lower()):
             mast = signal_masts_by_name[mast_name]
             logging.debug('Configuring signal mast %s', mast)
@@ -338,9 +458,36 @@ def Update(jmri_handle, openlcb_handle, reset_terminal=False):
                 summary = mast.PutAspect(context, layout_handle=jmri_handle, jmri_for_mem=jmri_handle)
             table.add_row([str(mast), summary.aspect, summary.appearance, summary.reason])
 
+            head_info = _DetermineMastTypeAndHeads(mast, summary)
+            new_masts[mast_name] = {
+                'type': head_info['type'],
+                'aspect': summary.aspect,
+                'appearance': summary.appearance,
+                'upper': head_info['upper'],
+                'lower': head_info['lower'],
+                'lit': head_info['lit'],
+                'reason': summary.reason,
+                'ts': now,
+            }
+
+        # Commit the per-mast snapshot before doing the dispatch-mode check —
+        # that call can raise in the wild (e.g. memory var not in JMRI yet),
+        # but the per-mast aspects are already valid and worth publishing.
+        signaling_mode = 'block'
         signaling_mode_suffix = ' [Block Signaling]'
-        if signal_config._DispatchSignalingMode(context):
-            signaling_mode_suffix = ' [Dispatch Signaling]'
+        with _status_lock:
+            _status_state['masts'] = new_masts
+            _status_state['last_update_ts'] = now
+            _status_state['signaling_mode'] = signaling_mode
+
+        try:
+            if signal_config._DispatchSignalingMode(context):
+                signaling_mode_suffix = ' [Dispatch Signaling]'
+                signaling_mode = 'dispatch'
+                with _status_lock:
+                    _status_state['signaling_mode'] = signaling_mode
+        except Exception:
+            logging.exception('DispatchSignalingMode check failed; assuming block')
 
         if reset_terminal:
             print(chr(27) + "[2J")
@@ -405,6 +552,10 @@ def main():
     parser.add_argument('--pretty', type=bool, default=False)
     parser.add_argument('--output_xml', type=bool, default=False)
     parser.add_argument('--scrape_panel_interval_sec', type=int, default=20)
+    parser.add_argument(
+        '--status_port', type=int, default=0,
+        help='If non-zero, start an HTTP server on this port exposing /status '
+             'with current mast aspects (for the SVL Signal Editor diagram view).')
     args = parser.parse_args()
 
     logging_args = {
@@ -433,6 +584,9 @@ def main():
         ScrapePanels(interval_sec=args.scrape_panel_interval_sec)
 
     openlcb_handle = OpenlcbLayoutHandle(None)
+
+    if args.status_port:
+        _StartStatusServer(args.status_port)
 
     while True:
         Update(jmri_handle, openlcb_handle, reset_terminal=args.pretty)

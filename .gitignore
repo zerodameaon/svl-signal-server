@@ -3,3 +3,4 @@
 .idea/*.*
 .idea/inspectionProfiles/*.*
 svl_signal_server.log
+signal_serverorig.py
