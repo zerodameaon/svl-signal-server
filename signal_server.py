@@ -12,6 +12,7 @@ from lxml import etree
 import socket
 from threading import Thread, RLock
 from selenium import webdriver
+from selenium.webdriver.common.by import By
 import sys
 import urllib.parse
 import json
@@ -147,7 +148,7 @@ class OpenlcbLayoutHandle(object):
                     logging.debug("Checking for LCC data...")
                     data = self._s.recv(4096)
                     logging.debug('got data: "%s"' % data)
-                    self._rcv_data += data
+                    self._rcv_data += data.decode('utf-8', errors='replace')
                 except socket.timeout:
                     pass
                 except:
@@ -508,7 +509,7 @@ def ScrapePanels(interval_sec):
         driver.implicitly_wait(3)
         driver.get(USER_PANELS)
         urls = set()
-        for link in driver.find_elements_by_tag_name('a'):
+        for link in driver.find_elements(By.TAG_NAME, 'a'):
             target = link.get_attribute('xlink:href')
             if '.svg' not in target:
                 continue
@@ -548,7 +549,6 @@ def Scrape(url):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--fake_jmri', type=bool, default=False)
     parser.add_argument('--pretty', type=bool, default=False)
     parser.add_argument('--output_xml', type=bool, default=False)
     parser.add_argument('--scrape_panel_interval_sec', type=int, default=20)
@@ -571,10 +571,7 @@ def main():
         OutputXML()
         return
 
-    if args.fake_jmri:
-        jmri_handle = jmri.FakeJMRI()
-    else:
-        jmri_handle = jmri.JMRI(SVL_JMRI_SERVER_HOST)
+    jmri_handle = jmri.JMRI(SVL_JMRI_SERVER_HOST)
 
     # openlcb_network = openlcb_python.tcpolcblink.TcpToOlcbLink()
     # openlcb_network.host = 'localhost'

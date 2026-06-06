@@ -164,35 +164,3 @@ class JMRI(object):
 		logging.info("Posting memory var to %s: %s", url, json_data)
 		self._PostToJMRI(url, json_data, create_on_404=False)
 
-class FakeJMRI(JMRI):
-	def __init__(self):
-		super(FakeJMRI, self).__init__('fake_jmri_address')
-
-	def GetCurrentTurnoutData(self):
-		return {
-			'NT176': TURNOUT_CLOSED,
-			'NT225': TURNOUT_CLOSED,
-			'NT227': TURNOUT_CLOSED,
-			'NT325': TURNOUT_CLOSED,
-		}
-
-	def GetCurrentSensorData(self):
-		return {
-			'LS174': SENSOR_INACTIVE,
-			'LS176': SENSOR_INACTIVE,
-			'LS177': SENSOR_INACTIVE,
-			'LS204': SENSOR_INACTIVE,
-		}
-
-	def GetMemoryVariables(self):
-		return {
-			'IMBA174': '',
-			'IMSVL_DISPATCH_SIGNALING': '',
-		}
-
-	def _GetJsonData(self, url_path):
-		raise NotImplementedError
-
-	def _PostToJMRI(self, url, json_data):
-		return True
-
