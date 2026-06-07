@@ -1,5 +1,8 @@
 import logging
+import logging.handlers
 import argparse
+import signal
+import sys
 from dataclasses import dataclass
 from enums import *
 from signal_requirements import *
@@ -263,29 +266,63 @@ def Update(jmri_handle, openlcb_handle, reset_terminal: bool = False) -> bool:
         return False
 
 
+def _SetAllMastsStopped(jmri_handle, openlcb_handle) -> None:
+    """Send STOP (red) to every mast. Called on shutdown."""
+    try:
+        masts = _LoadConfigCached()
+    except Exception:
+        logging.exception('Could not load config during shutdown')
+        return
+    for mast_name, mast in masts.items():
+        try:
+            layout_handle = openlcb_handle if mast.PostToOpenlcb() else jmri_handle
+            if isinstance(mast, signal_config.DoubleHeadTriLightMast):
+                layout_handle.SetTriLightSignalHeadAppearance(
+                    f'{mast_name}_upper', mast._upper_head_address, HEAD_RED)
+                layout_handle.SetTriLightSignalHeadAppearance(
+                    f'{mast_name}_lower', mast._lower_head_address, HEAD_RED)
+            elif isinstance(mast, signal_config.SingleHeadCPLMast):
+                layout_handle.SetLampAppearance(mast._red_address, 'ON')
+                layout_handle.SetLampAppearance(mast._green_address, 'OFF')
+                layout_handle.SetLampAppearance(mast._yellow_address, 'OFF')
+                layout_handle.SetLampAppearance(mast._lunar_address, 'OFF')
+            else:
+                layout_handle.SetTriLightSignalHeadAppearance(
+                    mast_name, mast._head_address, HEAD_RED)
+        except Exception:
+            logging.exception('Failed to stop mast %s during shutdown', mast_name)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pretty', action='store_true')
     parser.add_argument('--output_xml', action='store_true')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Mirror log output to stdout in addition to the log file.')
+    parser.add_argument(
+        '--jmri_host', default=SVL_JMRI_SERVER_HOST,
+        help=f'JMRI JSON server URL (default: {SVL_JMRI_SERVER_HOST})')
     parser.add_argument(
         '--status_port', type=int, default=0,
         help='If non-zero, start an HTTP server on this port exposing /status '
              'with current mast aspects (for the SVL Signal Editor diagram view).')
     args = parser.parse_args()
 
-    logging.basicConfig(
-        format='%(asctime)s %(filename)s:%(lineno)d %(message)s',
-        level=logging.DEBUG,
-        filename='svl_signal_server.log',
-    )
+    log_fmt = '%(asctime)s %(filename)s:%(lineno)d %(message)s'
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        'svl_signal_server.log', when='h', interval=1, backupCount=6)
+    handlers = [file_handler]
+    if args.verbose:
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(format=log_fmt, level=logging.DEBUG, handlers=handlers)
 
     if args.output_xml:
         OutputXML()
         return
 
-    jmri_handle = jmri.JMRI(SVL_JMRI_SERVER_HOST)
+    jmri_handle = jmri.JMRI(args.jmri_host)
 
-    print(f'Waiting for JMRI at {SVL_JMRI_SERVER_HOST}...')
+    print(f'Waiting for JMRI at {args.jmri_host}...')
     while True:
         try:
             jmri_handle.GetCurrentTurnoutData()
@@ -297,6 +334,15 @@ def main():
             time.sleep(5)
 
     openlcb_handle = OpenlcbLayoutHandle(None)
+
+    def _shutdown_handler(signum, frame):
+        print('\nShutting down — setting all signals to STOP...')
+        logging.info('Graceful shutdown requested (signal %d)', signum)
+        _SetAllMastsStopped(jmri_handle, openlcb_handle)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
 
     if args.status_port:
         _StartStatusServer(args.status_port)
