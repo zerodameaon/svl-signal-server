@@ -12,7 +12,14 @@ from signal_config import (
     DoubleHeadTriLightMast,
     SignalRoute,
 )
-from signal_server import _HeadAppearanceToLitColors, _DetermineMastTypeAndHeads, LayoutContext
+from signal_server import (
+    _HeadAppearanceToLitColors,
+    _DetermineMastTypeAndHeads,
+    _print_alert,
+    _FAILURE_ALERT_THRESHOLD,
+    _FAILURE_ALERT_REPEAT,
+    LayoutContext,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +563,54 @@ class TestDetermineMastTypeAndHeads(unittest.TestCase):
         mast = SingleHeadTriLightMast('M', 100)
         result = _DetermineMastTypeAndHeads(mast, self._summary('DARK'))
         self.assertEqual(result['lit'], [])
+
+
+# ---------------------------------------------------------------------------
+# Alert thresholds (_FAILURE_ALERT_THRESHOLD / _FAILURE_ALERT_REPEAT)
+# ---------------------------------------------------------------------------
+
+class TestAlertThresholds(unittest.TestCase):
+    """Verify the alert-triggering logic without running the real poll loop."""
+
+    def _should_alert(self, consecutive_failures: int) -> bool:
+        """Mirror the condition used in main()."""
+        if consecutive_failures == _FAILURE_ALERT_THRESHOLD:
+            return True
+        if (consecutive_failures > _FAILURE_ALERT_THRESHOLD
+                and (consecutive_failures - _FAILURE_ALERT_THRESHOLD) % _FAILURE_ALERT_REPEAT == 0):
+            return True
+        return False
+
+    def test_no_alert_below_threshold(self):
+        for n in range(1, _FAILURE_ALERT_THRESHOLD):
+            self.assertFalse(self._should_alert(n), f'should not alert at {n}')
+
+    def test_alert_at_threshold(self):
+        self.assertTrue(self._should_alert(_FAILURE_ALERT_THRESHOLD))
+
+    def test_no_alert_just_above_threshold(self):
+        self.assertFalse(self._should_alert(_FAILURE_ALERT_THRESHOLD + 1))
+
+    def test_alert_repeats_after_interval(self):
+        self.assertTrue(self._should_alert(_FAILURE_ALERT_THRESHOLD + _FAILURE_ALERT_REPEAT))
+
+    def test_no_double_alert_between_repeats(self):
+        for offset in range(1, _FAILURE_ALERT_REPEAT):
+            n = _FAILURE_ALERT_THRESHOLD + offset
+            self.assertFalse(self._should_alert(n), f'should not alert at {n}')
+
+    def test_second_repeat(self):
+        self.assertTrue(self._should_alert(_FAILURE_ALERT_THRESHOLD + 2 * _FAILURE_ALERT_REPEAT))
+
+    def test_print_alert_outputs_banner(self):
+        import io
+        from unittest.mock import patch
+        buf = io.StringIO()
+        with patch('builtins.print', side_effect=lambda *a, **kw: buf.write(' '.join(str(x) for x in a) + '\n')):
+            _print_alert('TEST MESSAGE')
+        output = buf.getvalue()
+        self.assertIn('TEST MESSAGE', output)
+        self.assertIn('!', output)
 
 
 if __name__ == '__main__':

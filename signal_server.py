@@ -21,6 +21,10 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 SIGNAL_CONFIG_FILE = os.path.join(DIR, 'signal_config.yaml')
 SVL_JMRI_SERVER_HOST = 'http://127.0.0.1:3000'
 SECONDS_BETWEEN_POLLS = 1.5
+# Ring the terminal bell and print a banner after this many consecutive JMRI failures,
+# then again every _FAILURE_ALERT_REPEAT failures thereafter.
+_FAILURE_ALERT_THRESHOLD = 3
+_FAILURE_ALERT_REPEAT = 5
 
 _config_cache = None
 _config_mtime = None
@@ -47,8 +51,18 @@ _status_state = {
     'config_path': SIGNAL_CONFIG_FILE,
     'uptime_sec': 0,
     'consecutive_failures': 0,
+    'jmri_alert': False,    # True while JMRI has been unreachable long enough to alert
 }
 _start_time = time.time()
+
+
+def _print_alert(message: str) -> None:
+    """Ring the terminal bell and print a prominent banner to stdout and the log."""
+    border = '!' * 60
+    print(f'\a{border}')
+    print(f'  {message}')
+    print(border)
+    logging.warning(message)
 
 
 @dataclass
@@ -353,20 +367,30 @@ def main():
     while True:
         success = Update(jmri_handle, openlcb_handle, reset_terminal=args.pretty)
         if success:
-            if consecutive_failures > 0:
+            if consecutive_failures >= _FAILURE_ALERT_THRESHOLD:
+                _print_alert(f'JMRI RECONNECTED after {consecutive_failures} failure(s) — signals resuming')
+            elif consecutive_failures > 0:
                 logging.info('JMRI reconnected after %d failure(s)', consecutive_failures)
                 print('JMRI reconnected.')
-                consecutive_failures = 0
+            consecutive_failures = 0
             sleep_secs = SECONDS_BETWEEN_POLLS
         else:
             consecutive_failures += 1
             sleep_secs = min(SECONDS_BETWEEN_POLLS * (2 ** consecutive_failures), _MAX_BACKOFF_SECS)
-            logging.info('JMRI unreachable, retrying in %.1fs (failure %d)', sleep_secs, consecutive_failures)
+            logging.warning('JMRI unreachable, retrying in %.1fs (failure %d)', sleep_secs, consecutive_failures)
             print(f'JMRI unreachable, retrying in {sleep_secs:.1f}s...')
+            # Alert at the threshold, then remind operators every _FAILURE_ALERT_REPEAT cycles.
+            if consecutive_failures == _FAILURE_ALERT_THRESHOLD:
+                _print_alert('JMRI UNREACHABLE — signals are frozen at their last known state')
+            elif (consecutive_failures > _FAILURE_ALERT_THRESHOLD
+                  and (consecutive_failures - _FAILURE_ALERT_THRESHOLD) % _FAILURE_ALERT_REPEAT == 0):
+                _print_alert(f'JMRI STILL UNREACHABLE — {consecutive_failures} consecutive failures')
 
+        jmri_alert = consecutive_failures >= _FAILURE_ALERT_THRESHOLD
         with _status_lock:
             _status_state['uptime_sec'] = int(time.time() - _start_time)
             _status_state['consecutive_failures'] = consecutive_failures
+            _status_state['jmri_alert'] = jmri_alert
 
         if args.pretty:
             print('Last Update:', time.ctime(time.time()))

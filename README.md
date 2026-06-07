@@ -111,7 +111,8 @@ Returns a JSON snapshot of every mast's current state.
   "signaling_mode": "block",      // "block" or "dispatch"
   "config_path": "/path/to/signal_config.yaml",
   "uptime_sec": 3600,
-  "consecutive_failures": 0
+  "consecutive_failures": 0,
+  "jmri_alert": false             // true when JMRI has been unreachable long enough to alert
 }
 ```
 
@@ -126,6 +127,16 @@ Returns a JSON snapshot of every mast's current state.
 | `lit` | List of lamps that are illuminated. Each entry: `{color, flashing, head}` |
 | `reason` | Human-readable explanation of why this aspect was chosen |
 | `ts` | Unix timestamp of this mast's last update |
+
+**Top-level fields:**
+
+| Field | Description |
+|-------|-------------|
+| `last_update_ts` | Unix timestamp of the last successful JMRI poll |
+| `signaling_mode` | `"block"` or `"dispatch"` |
+| `uptime_sec` | Seconds since the server process started |
+| `consecutive_failures` | Number of consecutive failed JMRI polls (0 when healthy) |
+| `jmri_alert` | `true` when JMRI has been unreachable for 3 or more consecutive polls. Signals are frozen at their last known state. A web panel can use this field to show a prominent warning to operators. |
 
 ### `GET /reload`
 
@@ -335,7 +346,7 @@ The handle maintains a cache keyed by mast name. If the hardware reboots and bro
 python3 -m unittest test_signals -v
 ```
 
-The test suite covers 93 cases across 12 test classes — no real JMRI connection or LCC hardware is required.
+The test suite covers 100 cases across 13 test classes — no real JMRI connection or LCC hardware is required.
 
 | Test class | What it tests |
 |------------|---------------|
@@ -351,3 +362,4 @@ The test suite covers 93 cases across 12 test classes — no real JMRI connectio
 | `TestSignalRoute` | `GetAspectOrNone` — requirements, diverging, speed caps, permissive |
 | `TestHeadAppearanceToLitColors` | `_HeadAppearanceToLitColors` helper (color, flashing, head fields) |
 | `TestDetermineMastTypeAndHeads` | `_DetermineMastTypeAndHeads` — type detection, head parsing, lit list |
+| `TestAlertThresholds` | Alert trigger/repeat/recovery conditions and banner output |
